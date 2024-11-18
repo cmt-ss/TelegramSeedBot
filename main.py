@@ -1,190 +1,148 @@
 import logging
+import json
+import base64
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
-import base64
-import os
-import json
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from os import urandom
 
-# Replace with your Telegram Bot Token
-TOKEN = '8172496913:AAGqJZB1yCDRIsAqeDX2q_niLcwMlIfFPsU'
-
-# Initialize logging
+# Set up logging to monitor errors and important events
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global Variables
-SALT = b"1234567890abcdef"  # Example Salt
-SEEDS_STORAGE = "seeds.json"
-key = None
-
-
-# Function to derive the key using PBKDF2 from the master password
+# Define the encryption and decryption methods
 def derive_key(password: str) -> bytes:
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=SALT,
-        iterations=100000,
-        backend=default_backend()
-    )
+    """Derive a key using PBKDF2 with HMAC (SHA-256) from the password."""
+    salt = urandom(16)  # Salt for PBKDF2
+    kdf = PBKDF2HMAC(algorithm=hashlib.sha256(), salt=salt, length=32, iterations=100000, backend=default_backend())
     return kdf.derive(password.encode())
 
-
-# Function to encrypt the seed using AES
-def encrypt_seed(seed: str, key: bytes) -> str:
-    iv = os.urandom(16)  # Generate a random IV for each encryption
+def encrypt_seed(seed_phrase: str, password: str) -> str:
+    """Encrypt the seed phrase using AES encryption."""
+    key = derive_key(password)
+    iv = urandom(16)  # Initialization Vector (IV) for AES encryption
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
+    padder = padding.PKCS7(128).padder()
+    padded_data = padder.update(seed_phrase.encode()) + padder.finalize()
     encryptor = cipher.encryptor()
-    padded_seed = seed + (16 - len(seed) % 16) * " "  # Padding to ensure multiple of 16
-    encrypted_seed = encryptor.update(padded_seed.encode()) + encryptor.finalize()
-    return base64.b64encode(iv + encrypted_seed).decode()
+    encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+    return base64.b64encode(iv + encrypted_data).decode()  # Return base64 encoded encrypted string
 
-
-# Function to decrypt the seed using AES
-def decrypt_seed(encrypted_seed: str, key: bytes) -> str:
+def decrypt_seed(encrypted_seed: str, password: str) -> str:
+    """Decrypt the seed phrase using AES decryption."""
     data = base64.b64decode(encrypted_seed)
     iv = data[:16]
     encrypted_data = data[16:]
+    key = derive_key(password)
     cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
     decryptor = cipher.decryptor()
-    decrypted_data = decryptor.update(encrypted_data) + decryptor.finalize()
-    return decrypted_data.decode().rstrip()  # Remove padding
+    decrypted_padded_data = decryptor.update(encrypted_data) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    decrypted_data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
+    return decrypted_data.decode()
 
+# Store and retrieve seeds from a JSON file
+def load_seeds():
+    """Load the encrypted seed phrases from a JSON file."""
+    try:
+        with open("seeds.json", "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return {}
 
-# Command handler for the /start command
-def start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text('Welcome to Seed Manager bot! Please enter your master password to begin.')
+def save_seeds(seeds):
+    """Save the encrypted seed phrases to a JSON file."""
+    with open("seeds.json", "w") as file:
+        json.dump(seeds, file)
 
+# Command handlers for the bot
+async def start(update: Update, context: CallbackContext) -> None:
+    """Send a welcome message when the /start command is issued."""
+    await update.message.reply_text('Welcome! Use /addseed to store a wallet seed.')
 
-# Command handler for setting the master password
-def set_master_password(update: Update, context: CallbackContext) -> None:
-    global key
-    if len(context.args) == 0:
-        update.message.reply_text('Please provide a master password with the command: /setpassword <your_password>')
+async def add_seed(update: Update, context: CallbackContext) -> None:
+    """Prompt the user to send a wallet seed phrase."""
+    await update.message.reply_text('Please send your wallet seed phrase.')
+
+async def store_seed(update: Update, context: CallbackContext) -> None:
+    """Store the seed phrase securely."""
+    seed_phrase = update.message.text
+    if not seed_phrase:
+        await update.message.reply_text('Seed phrase cannot be empty.')
         return
 
-    password = context.args[0]
-    key = derive_key(password)
-    update.message.reply_text('Master password set. You can now add and view seed phrases using the /addseed and /viewseeds commands.')
+    # Ask for the master password to encrypt the seed
+    await update.message.reply_text('Please enter your master password to secure the seed.')
 
+    context.user_data['seed_phrase'] = seed_phrase
 
-# Command handler for adding a seed phrase
-def add_seed(update: Update, context: CallbackContext) -> None:
-    if key is None:
-        update.message.reply_text('Please set your master password first using /setpassword <your_password>')
+async def process_master_password(update: Update, context: CallbackContext) -> None:
+    """Process the master password for encryption."""
+    master_password = update.message.text
+    seed_phrase = context.user_data.get('seed_phrase')
+
+    if not master_password or not seed_phrase:
+        await update.message.reply_text('No seed phrase or password provided.')
         return
 
-    if len(context.args) < 2:
-        update.message.reply_text('Please provide both label and seed phrase in the format: /addseed <label> <seed_phrase>')
+    encrypted_seed = encrypt_seed(seed_phrase, master_password)
+    seeds = load_seeds()
+
+    # Save encrypted seed with a unique key (e.g., user ID or a custom name)
+    seeds[update.message.from_user.id] = encrypted_seed
+    save_seeds(seeds)
+
+    await update.message.reply_text('Your wallet seed has been securely stored.')
+
+async def retrieve_seed(update: Update, context: CallbackContext) -> None:
+    """Retrieve a stored wallet seed."""
+    # Ask for the master password to decrypt the seed
+    await update.message.reply_text('Please enter your master password to retrieve your wallet seed.')
+
+async def process_retrieve_password(update: Update, context: CallbackContext) -> None:
+    """Process the master password for decryption."""
+    master_password = update.message.text
+    seeds = load_seeds()
+
+    # Retrieve the user's encrypted seed
+    encrypted_seed = seeds.get(update.message.from_user.id)
+
+    if not encrypted_seed:
+        await update.message.reply_text('No seed found for this user.')
         return
 
-    label = context.args[0]
-    seed_phrase = " ".join(context.args[1:])
-    
-    # Encrypt the seed
-    encrypted_seed = encrypt_seed(seed_phrase, key)
-
-    # Save the seed to file (JSON format)
-    seeds = {}
-    if os.path.exists(SEEDS_STORAGE):
-        with open(SEEDS_STORAGE, 'r') as f:
-            seeds = json.load(f)
-
-    seeds[label] = encrypted_seed
-
-    with open(SEEDS_STORAGE, 'w') as f:
-        json.dump(seeds, f)
-
-    update.message.reply_text(f"Seed for {label} saved successfully.")
-
-
-# Command handler for viewing saved seeds
-def view_seeds(update: Update, context: CallbackContext) -> None:
-    if key is None:
-        update.message.reply_text('Please set your master password first using /setpassword <your_password>')
-        return
-
-    if not os.path.exists(SEEDS_STORAGE):
-        update.message.reply_text('No seeds found. Please add seeds using /addseed command.')
-        return
-
-    with open(SEEDS_STORAGE, 'r') as f:
-        seeds = json.load(f)
-
-    if len(seeds) == 0:
-        update.message.reply_text('No seeds found.')
-        return
-
-    message = "Your saved seeds:\n\n"
-    for label, encrypted_seed in seeds.items():
-        decrypted_seed = decrypt_seed(encrypted_seed, key)
-        message += f"{label}: {decrypted_seed}\n"
-
-    update.message.reply_text(message)
-
-
-# Command handler for deleting a seed
-def delete_seed(update: Update, context: CallbackContext) -> None:
-    if key is None:
-        update.message.reply_text('Please set your master password first using /setpassword <your_password>')
-        return
-
-    if len(context.args) == 0:
-        update.message.reply_text('Please provide the label of the seed to delete using /deleteseed <label>')
-        return
-
-    label = context.args[0]
-
-    if not os.path.exists(SEEDS_STORAGE):
-        update.message.reply_text('No seeds found to delete.')
-        return
-
-    with open(SEEDS_STORAGE, 'r') as f:
-        seeds = json.load(f)
-
-    if label not in seeds:
-        update.message.reply_text(f"Seed with label '{label}' not found.")
-        return
-
-    del seeds[label]
-
-    with open(SEEDS_STORAGE, 'w') as f:
-        json.dump(seeds, f)
-
-    update.message.reply_text(f"Seed with label '{label}' has been deleted.")
-
+    decrypted_seed = decrypt_seed(encrypted_seed, master_password)
+    await update.message.reply_text(f'Your wallet seed is: {decrypted_seed}')
 
 # Error handler
 def error(update: Update, context: CallbackContext) -> None:
+    """Log errors."""
     logger.warning(f'Update {update} caused error {context.error}')
 
-
 # Main function to run the bot
-def main() -> None:
-    updater = Updater(TOKEN)
+async def main() -> None:
+    """Start the bot and set up handlers."""
+    TOKEN = '8172496913:AAGqJZB1yCDRIsAqeDX2q_niLcwMlIfFPsU'  # Replace with your actual token
+    
+    application = Application.builder().token(TOKEN).build()
 
-    dp = updater.dispatcher
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("addseed", add_seed))
+    application.add_handler(CommandHandler("retrieveseed", retrieve_seed))
 
-    # Register command handlers
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("setpassword", set_master_password))
-    dp.add_handler(CommandHandler("addseed", add_seed))
-    dp.add_handler(CommandHandler("viewseeds", view_seeds))
-    dp.add_handler(CommandHandler("deleteseed", delete_seed))
+    # Add message handlers for user input
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_seed))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_master_password))
 
-    # Log all errors
-    dp.add_error_handler(error)
+    # Start the bot with polling
+    await application.run_polling()
 
-    # Start the bot
-    updater.start_polling()
-
-    updater.idle()
-
-
+# Entry point for the script
 if __name__ == '__main__':
-    main()
+    import asyncio
+    asyncio.run(main())
