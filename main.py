@@ -1,6 +1,7 @@
 import logging
 import json
 import base64
+import hashlib
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -8,6 +9,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from os import urandom
+import asyncio
 
 # Set up logging to monitor errors and important events
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -144,5 +146,4 @@ async def main() -> None:
 
 # Entry point for the script
 if __name__ == '__main__':
-    import asyncio
     asyncio.run(main())
