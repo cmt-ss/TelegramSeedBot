@@ -1,149 +1,153 @@
-import logging
+import time
 import json
-import base64
-import hashlib
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from os import urandom
-import asyncio
+import telebot
+from cryptography.fernet import Fernet
 
-# Set up logging to monitor errors and important events
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Initialize bot with your token
+TOKEN = '8172496913:AAGqJZB1yCDRIsAqeDX2q_niLcwMlIfFPsU'
+bot = telebot.TeleBot(TOKEN)
 
-# Define the encryption and decryption methods
-def derive_key(password: str) -> bytes:
-    """Derive a key using PBKDF2 with HMAC (SHA-256) from the password."""
-    salt = urandom(16)  # Salt for PBKDF2
-    kdf = PBKDF2HMAC(algorithm=hashlib.sha256(), salt=salt, length=32, iterations=100000, backend=default_backend())
-    return kdf.derive(password.encode())
-
-def encrypt_seed(seed_phrase: str, password: str) -> str:
-    """Encrypt the seed phrase using AES encryption."""
-    key = derive_key(password)
-    iv = urandom(16)  # Initialization Vector (IV) for AES encryption
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    padder = padding.PKCS7(128).padder()
-    padded_data = padder.update(seed_phrase.encode()) + padder.finalize()
-    encryptor = cipher.encryptor()
-    encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
-    return base64.b64encode(iv + encrypted_data).decode()  # Return base64 encoded encrypted string
-
-def decrypt_seed(encrypted_seed: str, password: str) -> str:
-    """Decrypt the seed phrase using AES decryption."""
-    data = base64.b64decode(encrypted_seed)
-    iv = data[:16]
-    encrypted_data = data[16:]
-    key = derive_key(password)
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    decrypted_padded_data = decryptor.update(encrypted_data) + decryptor.finalize()
-    unpadder = padding.PKCS7(128).unpadder()
-    decrypted_data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
-    return decrypted_data.decode()
-
-# Store and retrieve seeds from a JSON file
-def load_seeds():
-    """Load the encrypted seed phrases from a JSON file."""
+# Generate a secure encryption key if not available
+def get_encryption_key():
     try:
-        with open("seeds.json", "r") as file:
-            return json.load(file)
+        with open('encryption.key', 'r') as key_file:
+            return key_file.read().encode()
     except FileNotFoundError:
-        return {}
+        key = Fernet.generate_key()
+        with open('encryption.key', 'w') as key_file:
+            key_file.write(key.decode())
+        return key
 
-def save_seeds(seeds):
-    """Save the encrypted seed phrases to a JSON file."""
-    with open("seeds.json", "w") as file:
-        json.dump(seeds, file)
+ENCRYPTION_KEY = get_encryption_key()
+cipher_suite = Fernet(ENCRYPTION_KEY)
 
-# Command handlers for the bot
-async def start(update: Update, context: CallbackContext) -> None:
-    """Send a welcome message when the /start command is issued."""
-    await update.message.reply_text('Welcome! Use /addseed to store a wallet seed.')
+# Load user data
+def load_data():
+    try:
+        with open('users.json', 'r') as file:
+            return json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"users": {}}
 
-async def add_seed(update: Update, context: CallbackContext) -> None:
-    """Prompt the user to send a wallet seed phrase."""
-    await update.message.reply_text('Please send your wallet seed phrase.')
+# Save user data
+def save_data(data):
+    with open('users.json', 'w') as file:
+        json.dump(data, file)
 
-async def store_seed(update: Update, context: CallbackContext) -> None:
-    """Store the seed phrase securely."""
-    seed_phrase = update.message.text
-    if not seed_phrase:
-        await update.message.reply_text('Seed phrase cannot be empty.')
-        return
+# Display main menu
+def menu(user_id):
+    keyboard = telebot.types.ReplyKeyboardMarkup(True)
+    keyboard.row('🔑 Add Seed Phrase', '📜 View Seed Phrases')
+    keyboard.row('🔒 Secure with Master Password', '⚙️ Settings')
+    bot.send_message(user_id, "*Main Menu*", parse_mode="Markdown", reply_markup=keyboard)
 
-    # Ask for the master password to encrypt the seed
-    await update.message.reply_text('Please enter your master password to secure the seed.')
+# Start command handler
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = str(message.chat.id)
+    data = load_data()
 
-    context.user_data['seed_phrase'] = seed_phrase
+    if user_id not in data["users"]:
+        data["users"][user_id] = {"seed_phrases": {}, "master_password": None}
+        save_data(data)
 
-async def process_master_password(update: Update, context: CallbackContext) -> None:
-    """Process the master password for encryption."""
-    master_password = update.message.text
-    seed_phrase = context.user_data.get('seed_phrase')
+    bot.send_message(user_id, "*Welcome to the Seed Phrase Wallet Bot!*", parse_mode="Markdown")
+    menu(user_id)
 
-    if not master_password or not seed_phrase:
-        await update.message.reply_text('No seed phrase or password provided.')
-        return
+# Add seed phrase
+@bot.message_handler(func=lambda msg: msg.text == '🔑 Add Seed Phrase')
+def add_seed_phrase_prompt(message):
+    user_id = str(message.chat.id)
+    send = bot.send_message(user_id, "_Enter the name of the wallet (e.g., Bitcoin, Ethereum)._", parse_mode="Markdown")
+    bot.register_next_step_handler(send, add_seed_phrase)
 
-    encrypted_seed = encrypt_seed(seed_phrase, master_password)
-    seeds = load_seeds()
+def add_seed_phrase(message):
+    user_id = str(message.chat.id)
+    wallet_name = message.text
+    send = bot.send_message(user_id, "_Enter the seed phrase for this wallet._", parse_mode="Markdown")
+    bot.register_next_step_handler(send, save_seed_phrase, wallet_name)
 
-    # Save encrypted seed with a unique key (e.g., user ID or a custom name)
-    seeds[update.message.from_user.id] = encrypted_seed
-    save_seeds(seeds)
+def save_seed_phrase(message, wallet_name):
+    user_id = str(message.chat.id)
+    seed_phrase = message.text
+    data = load_data()
 
-    await update.message.reply_text('Your wallet seed has been securely stored.')
+    encrypted_phrase = cipher_suite.encrypt(seed_phrase.encode()).decode()
+    data["users"][user_id]["seed_phrases"][wallet_name] = encrypted_phrase
+    save_data(data)
 
-async def retrieve_seed(update: Update, context: CallbackContext) -> None:
-    """Retrieve a stored wallet seed."""
-    # Ask for the master password to decrypt the seed
-    await update.message.reply_text('Please enter your master password to retrieve your wallet seed.')
+    bot.send_message(user_id, "✅ Seed phrase saved successfully!")
+    menu(user_id)
 
-async def process_retrieve_password(update: Update, context: CallbackContext) -> None:
-    """Process the master password for decryption."""
-    master_password = update.message.text
-    seeds = load_seeds()
+# View seed phrases
+@bot.message_handler(func=lambda msg: msg.text == '📜 View Seed Phrases')
+def view_seed_phrases(message):
+    user_id = str(message.chat.id)
+    data = load_data()
 
-    # Retrieve the user's encrypted seed
-    encrypted_seed = seeds.get(update.message.from_user.id)
+    seed_phrases = data["users"][user_id]["seed_phrases"]
+    if not seed_phrases:
+        bot.send_message(user_id, "❌ No seed phrases found.")
+    else:
+        msg = "*Your Seed Phrases:*\n"
+        for wallet, encrypted_phrase in seed_phrases.items():
+            decrypted_phrase = cipher_suite.decrypt(encrypted_phrase.encode()).decode()
+            msg += f"• {wallet}: `{decrypted_phrase}`\n"
+        bot.send_message(user_id, msg, parse_mode="Markdown")
+    menu(user_id)
 
-    if not encrypted_seed:
-        await update.message.reply_text('No seed found for this user.')
-        return
+# Secure with master password
+@bot.message_handler(func=lambda msg: msg.text == '🔒 Secure with Master Password')
+def set_master_password_prompt(message):
+    user_id = str(message.chat.id)
+    send = bot.send_message(user_id, "_Enter a master password to secure your wallet._", parse_mode="Markdown")
+    bot.register_next_step_handler(send, save_master_password)
 
-    decrypted_seed = decrypt_seed(encrypted_seed, master_password)
-    await update.message.reply_text(f'Your wallet seed is: {decrypted_seed}')
+def save_master_password(message):
+    user_id = str(message.chat.id)
+    master_password = message.text
+    data = load_data()
 
-# Error handler
-def error(update: Update, context: CallbackContext) -> None:
-    """Log errors."""
-    logger.warning(f'Update {update} caused error {context.error}')
+    encrypted_password = cipher_suite.encrypt(master_password.encode()).decode()
+    data["users"][user_id]["master_password"] = encrypted_password
+    save_data(data)
 
-# Main function to run the bot
-async def main() -> None:
-    """Start the bot and set up handlers."""
-    TOKEN = '8172496913:AAGqJZB1yCDRIsAqeDX2q_niLcwMlIfFPsU'  # Replace with your actual token
-    
-    application = Application.builder().token(TOKEN).build()
+    bot.send_message(user_id, "✅ Master password set successfully!")
+    menu(user_id)
 
-    # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("addseed", add_seed))
-    application.add_handler(CommandHandler("retrieveseed", retrieve_seed))
+# Settings
+@bot.message_handler(func=lambda msg: msg.text == '⚙️ Settings')
+def settings(message):
+    user_id = str(message.chat.id)
+    keyboard = telebot.types.ReplyKeyboardMarkup(True)
+    keyboard.row('🔄 Change Master Password', '❌ Delete All Data')
+    keyboard.row('🔙 Back to Menu')
+    bot.send_message(user_id, "*Settings Menu*", parse_mode="Markdown", reply_markup=keyboard)
 
-    # Add message handlers for user input
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_seed))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_master_password))
+# Change master password
+@bot.message_handler(func=lambda msg: msg.text == '🔄 Change Master Password')
+def change_master_password_prompt(message):
+    user_id = str(message.chat.id)
+    send = bot.send_message(user_id, "_Enter your new master password._", parse_mode="Markdown")
+    bot.register_next_step_handler(send, save_master_password)
 
-    # Start the bot with polling
-    await application.run_polling()
+# Delete all data
+@bot.message_handler(func=lambda msg: msg.text == '❌ Delete All Data')
+def delete_all_data(message):
+    user_id = str(message.chat.id)
+    data = load_data()
 
-# Entry point for the script
-if __name__ == '__main__':
-    asyncio.run(main())
+    data["users"].pop(user_id, None)
+    save_data(data)
+
+    bot.send_message(user_id, "✅ All your data has been deleted.")
+    menu(user_id)
+
+# Handle unrecognized commands
+@bot.message_handler(func=lambda message: True)
+def unknown_command(message):
+    bot.send_message(message.chat.id, "❌ Command not recognized. Use the menu options.")
+    menu(message.chat.id)
+
+# Run the bot
+bot.polling()
